@@ -1,0 +1,442 @@
+diff --git configs/common/CacheConfig.py configs/common/CacheConfig.py
+index 3fa3676b0..e1cdbef19 100644
+--- configs/common/CacheConfig.py
++++ configs/common/CacheConfig.py
+@@ -88,7 +88,8 @@ def config_cache(options, system):
+         # same clock as the CPUs.
+         system.l2 = l2_cache_class(clk_domain=system.cpu_clk_domain,
+                                    size=options.l2_size,
+-                                   assoc=options.l2_assoc)
++                                   assoc=options.l2_assoc,
++                                   replacement_policy=eval(options.l2_rpp))
+ 
+         system.tol2bus = L2XBar(clk_domain = system.cpu_clk_domain)
+         system.l2.cpu_side = system.tol2bus.master
+diff --git configs/common/Options.py configs/common/Options.py
+index 7963013df..a5f2a7cf3 100644
+--- configs/common/Options.py
++++ configs/common/Options.py
+@@ -115,6 +115,7 @@ def addNoISAOptions(parser):
+     parser.add_option("--l2_assoc", type="int", default=8)
+     parser.add_option("--l3_assoc", type="int", default=16)
+     parser.add_option("--cacheline_size", type="int", default=64)
++    parser.add_option("--l2_rpp", type="string", default="LRURP()")
+ 
+     # Enable Ruby
+     parser.add_option("--ruby", action="store_true")
+diff --git src/mem/cache/base.cc src/mem/cache/base.cc
+index 6049ca6a6..dab2583e1 100644
+--- src/mem/cache/base.cc
++++ src/mem/cache/base.cc
+@@ -925,7 +925,12 @@ BaseCache::access(PacketPtr pkt, CacheBlk *&blk, Cycles &lat,
+ 
+     // Access block in the tags
+     Cycles tag_latency(0);
+-    blk = tags->accessBlock(pkt->getAddr(), pkt->isSecure(), tag_latency);
++
++    // Dirty hack to allow replacementData to provide PC (Jhe-Yu Liou)
++    if (pkt->req->hasPC())
++        blk = tags->accessBlock(pkt->getAddr(), pkt->req->getPC(), pkt->isSecure(), tag_latency);
++    else
++        blk = tags->accessBlock(pkt->getAddr(), 0, pkt->isSecure(), tag_latency);
+ 
+     // Calculate access latency
+     lat = calculateAccessLatency(blk, tag_latency);
+@@ -1224,13 +1229,14 @@ BaseCache::allocateBlock(const PacketPtr pkt, PacketList &writebacks)
+ {
+     // Get address
+     const Addr addr = pkt->getAddr();
++    const Addr pc = (pkt->req->hasPC())? pkt->req->getPC() : 0;
+ 
+     // Get secure bit
+     const bool is_secure = pkt->isSecure();
+ 
+     // Find replacement victim
+     std::vector<CacheBlk*> evict_blks;
+-    CacheBlk *victim = tags->findVictim(addr, is_secure, evict_blks);
++    CacheBlk *victim = tags->findVictim(addr, pc, is_secure, evict_blks);
+ 
+     // It is valid to return nullptr if there is no victim
+     if (!victim)
+@@ -1282,7 +1288,7 @@ BaseCache::allocateBlock(const PacketPtr pkt, PacketList &writebacks)
+     }
+ 
+     // Insert new block at victimized entry
+-    tags->insertBlock(addr, is_secure, pkt->req->masterId(),
++    tags->insertBlock(addr, pc, is_secure, pkt->req->masterId(),
+                       pkt->req->taskId(), victim);
+ 
+     return victim;
+diff --git src/mem/cache/replacement_policies/replaceable_entry.hh src/mem/cache/replacement_policies/replaceable_entry.hh
+index bf54e2264..5acd87477 100644
+--- src/mem/cache/replacement_policies/replaceable_entry.hh
++++ src/mem/cache/replacement_policies/replaceable_entry.hh
+@@ -33,12 +33,67 @@
+ 
+ #include <cstdint>
+ #include <memory>
++#include <vector>
++
++class ReplaceableEntry;
+ 
+ /**
+  * The replacement data needed by replacement policies. Each replacement policy
+  * should have its own implementation of replacement data.
+  */
+-struct ReplacementData {};
++/**
++ * Dirty hack to allow ReplacementData to provide PC/set/way for CSE520 course need
++ * so that the existing replacement policies don't need to be modified. (Jhe-Yu Liou)
++ */
++class ReplacementData
++{
++private:
++    uint64_t pc;
++    uint32_t set;
++    uint32_t way;
++
++    std::vector<ReplaceableEntry*> *setAssocEntry;
++
++public:
++    /**
++     * DO NOT use the following 2 setXX function in this assignment !!
++     * Create and modify the data from the policy-defined data class who
++     * inherits from this class. Examples can be found in other replacement
++     * policy implementation like LRU.
++     */
++    void setPosition(const uint32_t set, const uint32_t way, std::vector<ReplaceableEntry*> *setAssocEntry) {
++        this->set = set;
++        this->way = way;
++        this->setAssocEntry = setAssocEntry;
++    }
++
++    void setPC(const uint64_t pc) {
++        this->pc = pc;
++    }
++
++    /**
++     * getSet() and getWay() return the cache block's set and way in number
++     * You can use this 2 numbers to calculate the block address
++     */
++    uint32_t getSet() const { return set; }
++    uint32_t getWay() const { return way; }
++
++    /**
++     * getPC() return the program counter of the instruction who recently access the block
++     */
++    uint64_t getPC() const { return pc; }
++
++    /**
++     * getSetAssocEntry() return the blocks in a std::vector who live in the same set.
++     * This is for you to access other block and update their replacement data
++     * as required in the first step of AIP cache replacement policy.
++     *
++     * Note: the blocks return in the vector is in ReplaceableEntry class so you
++     * have to access its member variable:`ReplacementData` and cast to the
++     * policy-defined data class before accessing the data you need.
++     */
++    std::vector<ReplaceableEntry*> getSetAssocEntry() { return *setAssocEntry; }
++};
+ 
+ /**
+  * A replaceable entry is a basic entry in a 2d table-like structure that needs
+@@ -69,6 +124,7 @@ class ReplaceableEntry
+       * It must be instantiated by the replacement policy before being used.
+       */
+      std::shared_ptr<ReplacementData> replacementData;
++     std::vector<ReplaceableEntry*> *setAssocEntry;
+ 
+     /**
+      * Set both the set and way. Should be called only once.
+@@ -79,6 +135,7 @@ class ReplaceableEntry
+     void setPosition(const uint32_t set, const uint32_t way) {
+         _set = set;
+         _way = way;
++        replacementData->setPosition(set, way, setAssocEntry);
+     }
+ 
+     /**
+diff --git src/mem/cache/tags/base.cc src/mem/cache/tags/base.cc
+index 7237f1821..34c525ea3 100644
+--- src/mem/cache/tags/base.cc
++++ src/mem/cache/tags/base.cc
+@@ -98,7 +98,7 @@ BaseTags::findBlock(Addr addr, bool is_secure) const
+ }
+ 
+ void
+-BaseTags::insertBlock(const Addr addr, const bool is_secure,
++BaseTags::insertBlock(const Addr addr, const Addr pc, const bool is_secure,
+                       const int src_master_ID, const uint32_t task_ID,
+                       CacheBlk *blk)
+ {
+diff --git src/mem/cache/tags/base.hh src/mem/cache/tags/base.hh
+index 840193b7a..b136cd675 100644
+--- src/mem/cache/tags/base.hh
++++ src/mem/cache/tags/base.hh
+@@ -278,7 +278,7 @@ class BaseTags : public ClockedObject
+      * @param evict_blks Cache blocks to be evicted.
+      * @return Cache block to be replaced.
+      */
+-    virtual CacheBlk* findVictim(Addr addr, const bool is_secure,
++    virtual CacheBlk* findVictim(Addr addr, Addr pc, const bool is_secure,
+                                  std::vector<CacheBlk*>& evict_blks) const = 0;
+ 
+     /**
+@@ -292,7 +292,7 @@ class BaseTags : public ClockedObject
+      * @param lat The latency of the tag lookup.
+      * @return Pointer to the cache block if found.
+      */
+-    virtual CacheBlk* accessBlock(Addr addr, bool is_secure, Cycles &lat) = 0;
++    virtual CacheBlk* accessBlock(Addr addr, Addr pc, bool is_secure, Cycles &lat) = 0;
+ 
+     /**
+      * Generate the tag from the given address.
+@@ -311,7 +311,7 @@ class BaseTags : public ClockedObject
+      * @param task_ID The new task ID.
+      * @param blk The block to update.
+      */
+-    virtual void insertBlock(const Addr addr, const bool is_secure,
++    virtual void insertBlock(const Addr addr, const Addr pc, const bool is_secure,
+                              const int src_master_ID, const uint32_t task_ID,
+                              CacheBlk *blk);
+ 
+diff --git src/mem/cache/tags/base_set_assoc.cc src/mem/cache/tags/base_set_assoc.cc
+index 1b53ef050..7bde364f1 100644
+--- src/mem/cache/tags/base_set_assoc.cc
++++ src/mem/cache/tags/base_set_assoc.cc
+@@ -70,14 +70,15 @@ BaseSetAssoc::tagsInit()
+         // Locate next cache block
+         CacheBlk* blk = &blks[blk_index];
+ 
++        // Associate a replacement data entry to the block
++        // Init replPolicy earlier than setEntry in order to pass set/way to replPolicy (Jhe-Yu Liou)
++        blk->replacementData = replacementPolicy->instantiateEntry();
++
+         // Link block to indexing policy
+         indexingPolicy->setEntry(blk, blk_index);
+ 
+         // Associate a data chunk to the block
+         blk->data = &dataBlks[blkSize*blk_index];
+-
+-        // Associate a replacement data entry to the block
+-        blk->replacementData = replacementPolicy->instantiateEntry();
+     }
+ }
+ 
+diff --git src/mem/cache/tags/base_set_assoc.hh src/mem/cache/tags/base_set_assoc.hh
+index b1fa88464..1cc7f906a 100644
+--- src/mem/cache/tags/base_set_assoc.hh
++++ src/mem/cache/tags/base_set_assoc.hh
+@@ -122,7 +122,7 @@ class BaseSetAssoc : public BaseTags
+      * @param lat The latency of the tag lookup.
+      * @return Pointer to the cache block if found.
+      */
+-    CacheBlk* accessBlock(Addr addr, bool is_secure, Cycles &lat) override
++    CacheBlk* accessBlock(Addr addr, Addr pc, bool is_secure, Cycles &lat) override
+     {
+         CacheBlk *blk = findBlock(addr, is_secure);
+ 
+@@ -143,6 +143,9 @@ class BaseSetAssoc : public BaseTags
+             // Update number of references to accessed block
+             blk->refCount++;
+ 
++            // Dirty hack to allow replacementData to provide PC (Jhe-Yu Liou)
++            blk->replacementData->setPC(pc);
++
+             // Update replacement data of accessed block
+             replacementPolicy->touch(blk->replacementData);
+         }
+@@ -162,13 +165,17 @@ class BaseSetAssoc : public BaseTags
+      * @param evict_blks Cache blocks to be evicted.
+      * @return Cache block to be replaced.
+      */
+-    CacheBlk* findVictim(Addr addr, const bool is_secure,
++    CacheBlk* findVictim(Addr addr, Addr pc, const bool is_secure,
+                          std::vector<CacheBlk*>& evict_blks) const override
+     {
+         // Get possible entries to be victimized
+         const std::vector<ReplaceableEntry*> entries =
+             indexingPolicy->getPossibleEntries(addr);
+ 
++        for (auto entry : entries) {
++            entry->replacementData->setPC(pc);
++        }
++
+         // Choose replacement victim from replacement candidates
+         CacheBlk* victim = static_cast<CacheBlk*>(replacementPolicy->getVictim(
+                                 entries));
+@@ -188,16 +195,18 @@ class BaseSetAssoc : public BaseTags
+      * @param task_ID The new task ID.
+      * @param blk The block to update.
+      */
+-    void insertBlock(const Addr addr, const bool is_secure,
++    void insertBlock(const Addr addr, const Addr pc, const bool is_secure,
+                      const int src_master_ID, const uint32_t task_ID,
+                      CacheBlk *blk) override
+     {
+         // Insert block
+-        BaseTags::insertBlock(addr, is_secure, src_master_ID, task_ID, blk);
++        BaseTags::insertBlock(addr, pc, is_secure, src_master_ID, task_ID, blk);
+ 
+         // Increment tag counter
+         tagsInUse++;
+ 
++        blk->replacementData->setPC(pc);
++
+         // Update replacement policy
+         replacementPolicy->reset(blk->replacementData);
+     }
+diff --git src/mem/cache/tags/fa_lru.cc src/mem/cache/tags/fa_lru.cc
+index b1f9bbc92..8472628bd 100644
+--- src/mem/cache/tags/fa_lru.cc
++++ src/mem/cache/tags/fa_lru.cc
+@@ -138,7 +138,7 @@ FALRU::invalidate(CacheBlk *blk)
+ }
+ 
+ CacheBlk*
+-FALRU::accessBlock(Addr addr, bool is_secure, Cycles &lat)
++FALRU::accessBlock(Addr addr, Addr pc, bool is_secure, Cycles &lat)
+ {
+     return accessBlock(addr, is_secure, lat, 0);
+ }
+@@ -196,7 +196,7 @@ FALRU::findBlockBySetAndWay(int set, int way) const
+ }
+ 
+ CacheBlk*
+-FALRU::findVictim(Addr addr, const bool is_secure,
++FALRU::findVictim(Addr addr, Addr pc, const bool is_secure,
+                   std::vector<CacheBlk*>& evict_blks) const
+ {
+     // The victim is always stored on the tail for the FALRU
+@@ -209,7 +209,7 @@ FALRU::findVictim(Addr addr, const bool is_secure,
+ }
+ 
+ void
+-FALRU::insertBlock(const Addr addr, const bool is_secure,
++FALRU::insertBlock(const Addr addr, const Addr pc, const bool is_secure,
+                    const int src_master_ID, const uint32_t task_ID,
+                    CacheBlk *blk)
+ {
+@@ -219,7 +219,7 @@ FALRU::insertBlock(const Addr addr, const bool is_secure,
+     assert(falruBlk->inCachesMask == 0);
+ 
+     // Do common block insertion functionality
+-    BaseTags::insertBlock(addr, is_secure, src_master_ID, task_ID, blk);
++    BaseTags::insertBlock(addr, pc, is_secure, src_master_ID, task_ID, blk);
+ 
+     // Increment tag counter
+     tagsInUse++;
+diff --git src/mem/cache/tags/fa_lru.hh src/mem/cache/tags/fa_lru.hh
+index 0cae1dea6..b00525555 100644
+--- src/mem/cache/tags/fa_lru.hh
++++ src/mem/cache/tags/fa_lru.hh
+@@ -192,7 +192,7 @@ class FALRU : public BaseTags
+     /**
+      * Just a wrapper of above function to conform with the base interface.
+      */
+-    CacheBlk* accessBlock(Addr addr, bool is_secure, Cycles &lat) override;
++    CacheBlk* accessBlock(Addr addr, Addr pc, bool is_secure, Cycles &lat) override;
+ 
+     /**
+      * Find the block in the cache, do not update the replacement data.
+@@ -221,7 +221,7 @@ class FALRU : public BaseTags
+      * @param evict_blks Cache blocks to be evicted.
+      * @return Cache block to be replaced.
+      */
+-    CacheBlk* findVictim(Addr addr, const bool is_secure,
++    CacheBlk* findVictim(Addr addr, Addr pc, const bool is_secure,
+                          std::vector<CacheBlk*>& evict_blks) const override;
+ 
+     /**
+@@ -233,7 +233,7 @@ class FALRU : public BaseTags
+      * @param task_ID The new task ID.
+      * @param blk The block to update.
+      */
+-    void insertBlock(const Addr addr, const bool is_secure,
++    void insertBlock(const Addr addr, const Addr pc, const bool is_secure,
+                      const int src_master_ID, const uint32_t task_ID,
+                      CacheBlk *blk) override;
+ 
+diff --git src/mem/cache/tags/indexing_policies/base.cc src/mem/cache/tags/indexing_policies/base.cc
+index accc18561..44065343d 100644
+--- src/mem/cache/tags/indexing_policies/base.cc
++++ src/mem/cache/tags/indexing_policies/base.cc
+@@ -92,6 +92,7 @@ BaseIndexingPolicy::setEntry(ReplaceableEntry* entry, const uint64_t index)
+     sets[set][way] = entry;
+ 
+     // Inform the entry its position
++    entry->setAssocEntry = &sets[set];
+     entry->setPosition(set, way);
+ }
+ 
+diff --git src/mem/cache/tags/sector_tags.cc src/mem/cache/tags/sector_tags.cc
+index ad374e5ee..9ff32d2ff 100644
+--- src/mem/cache/tags/sector_tags.cc
++++ src/mem/cache/tags/sector_tags.cc
+@@ -130,7 +130,7 @@ SectorTags::invalidate(CacheBlk *blk)
+ }
+ 
+ CacheBlk*
+-SectorTags::accessBlock(Addr addr, bool is_secure, Cycles &lat)
++SectorTags::accessBlock(Addr addr, Addr pc, bool is_secure, Cycles &lat)
+ {
+     CacheBlk *blk = findBlock(addr, is_secure);
+ 
+@@ -167,7 +167,7 @@ SectorTags::accessBlock(Addr addr, bool is_secure, Cycles &lat)
+ }
+ 
+ void
+-SectorTags::insertBlock(const Addr addr, const bool is_secure,
++SectorTags::insertBlock(const Addr addr, const Addr pc, const bool is_secure,
+                         const int src_master_ID, const uint32_t task_ID,
+                         CacheBlk *blk)
+ {
+@@ -189,7 +189,7 @@ SectorTags::insertBlock(const Addr addr, const bool is_secure,
+     }
+ 
+     // Do common block insertion functionality
+-    BaseTags::insertBlock(addr, is_secure, src_master_ID, task_ID, blk);
++    BaseTags::insertBlock(addr, pc, is_secure, src_master_ID, task_ID, blk);
+ }
+ 
+ CacheBlk*
+@@ -220,7 +220,7 @@ SectorTags::findBlock(Addr addr, bool is_secure) const
+ }
+ 
+ CacheBlk*
+-SectorTags::findVictim(Addr addr, const bool is_secure,
++SectorTags::findVictim(Addr addr, Addr pc, const bool is_secure,
+                        std::vector<CacheBlk*>& evict_blks) const
+ {
+     // Get possible entries to be victimized
+diff --git src/mem/cache/tags/sector_tags.hh src/mem/cache/tags/sector_tags.hh
+index e3c0fa447..439ec63d4 100644
+--- src/mem/cache/tags/sector_tags.hh
++++ src/mem/cache/tags/sector_tags.hh
+@@ -124,7 +124,7 @@ class SectorTags : public BaseTags
+      * @param lat The latency of the tag lookup.
+      * @return Pointer to the cache block if found.
+      */
+-    CacheBlk* accessBlock(Addr addr, bool is_secure, Cycles &lat) override;
++    CacheBlk* accessBlock(Addr addr, Addr pc, bool is_secure, Cycles &lat) override;
+ 
+     /**
+      * Insert the new block into the cache and update replacement data.
+@@ -135,7 +135,7 @@ class SectorTags : public BaseTags
+      * @param task_ID The new task ID.
+      * @param blk The block to update.
+      */
+-    void insertBlock(const Addr addr, const bool is_secure,
++    void insertBlock(const Addr addr, const Addr pc, const bool is_secure,
+                      const int src_master_ID, const uint32_t task_ID,
+                      CacheBlk *blk) override;
+ 
+@@ -157,7 +157,7 @@ class SectorTags : public BaseTags
+      * @param evict_blks Cache blocks to be evicted.
+      * @return Cache block to be replaced.
+      */
+-    CacheBlk* findVictim(Addr addr, const bool is_secure,
++    CacheBlk* findVictim(Addr addr, Addr pc, const bool is_secure,
+                          std::vector<CacheBlk*>& evict_blks) const override;
+ 
+     /**
