@@ -1,0 +1,422 @@
+diff -Naur /home/neo/finalWorkRefCnt/gem5/src/mem/cache/replacement_policies/refCount_rp.cc /home/neo/myRefCount/gem5/src/mem/cache/replacement_policies/refCount_rp.cc
+--- /home/neo/finalWorkRefCnt/gem5/src/mem/cache/replacement_policies/refCount_rp.cc	1969-12-31 16:00:00.000000000 -0800
++++ /home/neo/myRefCount/gem5/src/mem/cache/replacement_policies/refCount_rp.cc	2020-03-24 23:04:53.854988665 -0700
+@@ -0,0 +1,246 @@
++#include <cstdint>
++#include <cassert>
++#include <memory>
++#include <vector>
++#include <string>
++#include <sstream>
++#include "mem/cache/replacement_policies/refCount_rp.hh"
++#include "params/RefCount.hh"
++using namespace std;
++
++uint16_t table1[256][256]={0};
++
++RefCount::RefCount(const Params *p)
++    : BaseReplacementPolicy(p)
++{
++}
++
++void
++RefCount::invalidate(const std::shared_ptr<ReplacementData>& replacement_data)
++const
++{
++    // Reset counter to maximum value
++    std::static_pointer_cast<RFCReplData>(replacement_data)->c = 15;
++    // Set confidence bit to 1 to make the data next probable victim
++    std::static_pointer_cast<RFCReplData>(replacement_data)->conf = 1;
++}
++
++void
++RefCount::touch(const std::shared_ptr<ReplacementData>& replacement_data) const
++{
++
++    // Increment the event counter of each line in a set
++    std::vector<ReplaceableEntry*> setEntries;
++    setEntries=replacement_data->getSetAssocEntry();
++    for (auto& setEntry : setEntries)
++    {
++        std::static_pointer_cast<RFCReplData>(setEntry->replacementData)->c++;
++        
++    }
++    // recording the new threshold maximum of replacement data
++    if((std::static_pointer_cast<RFCReplData>(replacement_data)->c) > 
++        (std::static_pointer_cast<RFCReplData>(replacement_data)->maxCpresent))
++        {
++            std::static_pointer_cast<RFCReplData>(replacement_data)->maxCpresent = std::static_pointer_cast<RFCReplData>(replacement_data)->c;
++            
++        }
++     if(std::static_pointer_cast<RFCReplData>(replacement_data)->maxCpresent > 15)
++        {
++            std::static_pointer_cast<RFCReplData>(replacement_data)->maxCpresent=15;   
++        }
++    // reset the counter value of replacement data
++    std::static_pointer_cast<RFCReplData>(replacement_data)->c=0; 
++}
++
++void
++RefCount::reset(const std::shared_ptr<ReplacementData>& replacement_data) const
++{
++    // Increment the event counter of each line in a set in case of a miss
++    std::vector<ReplaceableEntry*> setEntries;
++    setEntries=replacement_data->getSetAssocEntry();
++    for (auto& setEntry : setEntries)
++    {
++        std::static_pointer_cast<RFCReplData>(setEntry->replacementData)->c++;
++    }
++    //reset the value of counter and maxCpresent
++    std::static_pointer_cast<RFCReplData>(replacement_data)->c=0;
++    std::static_pointer_cast<RFCReplData>(replacement_data)->maxCpresent=0;
++
++    // retrieving the value of hashed PC
++    uint64_t PC= replacement_data->getPC();
++    IndexTable newLine;
++    uint8_t hashPC=newLine.getHashedPC(PC);
++    std::static_pointer_cast<RFCReplData>(replacement_data)->hashedPC=hashPC;
++    // retrieving set and way of replacement data
++    uint32_t newLineSet=std::static_pointer_cast<RFCReplData>(replacement_data)->getSet();
++    uint32_t newLineWay=std::static_pointer_cast<RFCReplData>(replacement_data)->getWay();
++    // retrieving hashed value of line address of repalcement data
++    uint8_t col_val=newLine.calculateColumnId(newLineSet,newLineWay);
++    // retrieving confidence bit of replacement data
++    bool confBit=newLine.getConfidenceBit(hashPC,col_val);
++    std::static_pointer_cast<RFCReplData>(replacement_data)->conf=confBit;
++    // retrieving maxCpast of replacement data
++    uint8_t c_stored=newLine.getMaxCPast(hashPC,col_val);
++    std::static_pointer_cast<RFCReplData>(replacement_data)->maxCpast=c_stored;
++
++}
++
++ReplaceableEntry*
++RefCount::getVictim(const ReplacementCandidates& candidates) const
++{
++    // There must be at least one replacement candidate
++    assert(candidates.size() > 0);
++   
++    std::vector<ReplaceableEntry*> expiredLines;
++    // Visit all candidates to find expired lines and store in expiredLines vector
++    for (const auto& candidate : candidates) {
++        if ((std::static_pointer_cast<RFCReplData>(candidate->replacementData)->c > 
++                std::static_pointer_cast<RFCReplData>(candidate->replacementData)->maxCpresent )&&
++                (std::static_pointer_cast<RFCReplData>(candidate->replacementData)->c > 
++                std::static_pointer_cast<RFCReplData>(candidate->replacementData)->maxCpast) &&
++                (std::static_pointer_cast<RFCReplData>(candidate->replacementData)->conf==1)) 
++                    {
++                        expiredLines.push_back(candidate);
++                    }
++    }
++
++    ReplaceableEntry* victim=candidates[0];
++    
++    // Case 1: Return LRU line on the basis of max counter value if there are no expired lines.
++    if(expiredLines.size()==0)
++    {
++        for (const auto& candidate : candidates) 
++        {
++            if(std::static_pointer_cast<RFCReplData>( candidate->replacementData)->c > 
++                std::static_pointer_cast<RFCReplData>( victim->replacementData)->c )
++                {
++                    victim=candidate;
++                }
++        }
++    }
++    
++    /* Return expired line on the basis of confidence bit and threshold values. If there are multiple expired lines return the line whose
++     counter value is maximum. */
++    else
++    {   
++        victim = expiredLines[0];
++        for(auto& expiredLine : expiredLines)
++        {
++            if(std::static_pointer_cast<RFCReplData>( expiredLine->replacementData)->c > 
++                std::static_pointer_cast<RFCReplData>( victim->replacementData)->c )
++                {
++                    victim=expiredLine;
++                }
++        }
++    }
++    // Get set and way of victim line
++    uint32_t victimSet=std::static_pointer_cast<RFCReplData>( victim->replacementData)->getSet();
++    uint32_t victimWay=std::static_pointer_cast<RFCReplData>( victim->replacementData)->getWay();
++
++    uint8_t hashPC=std::static_pointer_cast<RFCReplData>( victim->replacementData)->hashedPC;
++    bool confidenceBit=std::static_pointer_cast<RFCReplData>( victim->replacementData)->conf;
++    uint8_t currentThreshold=std::static_pointer_cast<RFCReplData>( victim->replacementData)->maxCpresent;
++    IndexTable indexVictim;
++    //calculate hashed value of line address of victim line
++    uint8_t colAddress=indexVictim.calculateColumnId(victimSet,victimWay);
++    // store confidence bit and threshold value of victim line in prediction table
++    indexVictim.storeData(hashPC,colAddress,currentThreshold,confidenceBit);
++    return victim;
++
++
++}
++uint8_t IndexTable :: calculateColumnId(uint32_t victimSet,uint32_t victimWay)
++      {
++          
++          /*string s1=to_string(victimSet);
++          string s2=to_string(victimWay);
++          // concatenating the string.
++          string s = s1 + s2;
++          uint64_t indexColumn;
++          //store the value of concatinated string into indexColumn of uint64_t type
++          std::istringstream iss(s);
++          iss >> indexColumn;*/
++          uint32_t set=victimSet;
++          uint8_t partSet[4];
++          uint8_t resultXor=0;
++          for(int i=0;i<4;i++)
++          {
++              partSet[i]=(uint8_t)(set & 0xFF);
++              resultXor=resultXor ^ partSet[i];
++              set=(set >> 8);
++          }
++          uint32_t way=victimWay;
++          uint8_t partWay[4];
++          for(int i=0;i<4;i++)
++          {
++              partWay[i]=(uint8_t)(way & 0xFF);
++              resultXor=resultXor ^ partWay[i];
++              way=(way >> 8);
++          }
++
++          return resultXor;
++          
++      }
++
++
++void IndexTable :: storeData(uint8_t PC, uint8_t colAddress, uint8_t cStored, bool conf)
++      {
++        // concatinate the value of threshold and confidence bit to store as a single value in 2Darray
++        string s1=to_string(cStored);
++        string s2=to_string(conf);
++        string s = s1 + s2;
++        uint16_t value;
++        //converting string to unsigned integer of 16bit
++        std::istringstream iss(s);
++        iss >> value;
++
++        table1[PC][colAddress]=value;
++      }
++
++ uint8_t  IndexTable :: getHashedPC(uint64_t PC)
++      {
++            uint8_t parts[8];
++            // dividing 64 bit PC into 8 bit parts
++            for(int i=0;i<8;i++)
++            {
++                parts[i]=(int8_t)(PC & 0xFF);
++                PC=(PC >> 8);
++            } 
++            uint8_t result=0;
++            //XORing 8 bit parts
++            for(int i=0;i<8;i++)
++           {
++              result=result ^ parts[i];
++           }
++        return result;
++      }
++
++bool IndexTable ::  getConfidenceBit(uint8_t PC,uint8_t columnID)
++    {
++      uint16_t temp=table1[PC][columnID];
++      // confidence bit is the last digit of stored value in prediction table
++      bool confBit=temp %10;
++      return confBit;
++
++    }
++    uint8_t IndexTable :: getMaxCPast (uint8_t PC,uint8_t columnID)
++    {
++      uint16_t temp=table1[PC][columnID];
++      // threshold value is obtained by removing last digit(which is confidence bit) from stored value
++      temp=(uint8_t)temp/10;
++      return temp;
++    }
++
++std::shared_ptr<ReplacementData>
++RefCount::instantiateEntry()
++{
++    return std::shared_ptr<ReplacementData>(new RFCReplData());
++}
++
++
++RefCount*
++RefCountParams::create()
++{
++    return new RefCount(this);
++}
++
+diff -Naur /home/neo/finalWorkRefCnt/gem5/src/mem/cache/replacement_policies/refCount_rp.hh /home/neo/myRefCount/gem5/src/mem/cache/replacement_policies/refCount_rp.hh
+--- /home/neo/finalWorkRefCnt/gem5/src/mem/cache/replacement_policies/refCount_rp.hh	1969-12-31 16:00:00.000000000 -0800
++++ /home/neo/myRefCount/gem5/src/mem/cache/replacement_policies/refCount_rp.hh	2020-03-24 23:04:53.854988665 -0700
+@@ -0,0 +1,148 @@
++
++/**
++ * @file
++ * Declaration of a refCount replacement policy.
++ * The victim is chosen using the reference frequency and the confidence bit. The line in cache whose reference frequency is greater than the
++ * threshold values maxCpresent and maxCpast and confidence bit is 1 becomes the victim line and is evicted. The hashedPC for each line is XOR of PC
++ * that causes a miss and is used to retrieve the row containing information of maxCpast and confidence bit of the cache line from prediction table.
++ */
++
++#ifndef __MEM_CACHE_REPLACEMENT_POLICIES_RefCount_RP_HH__
++#define __MEM_CACHE_REPLACEMENT_POLICIES_RefCount_RP_HH__
++
++#include "mem/cache/replacement_policies/base.hh"
++#include <cstdint>
++
++using namespace std;
++
++struct RefCountParams;
++
++extern uint16_t table1[256][256];
++//declaration of Refcount class
++class RefCount : public BaseReplacementPolicy
++{
++  protected:
++    /** RefCount-specific implementation of replacement data. */
++    struct RFCReplData : ReplacementData
++    {
++        
++        uint8_t c;  // event counter.  
++        uint8_t maxCpresent;  // counter theshold for time interval  in the current generation of line
++        uint8_t maxCpast;  // counter theshold for time interval  in the most recent generation of line
++        uint8_t hashedPC;  // to index a row in prediction table when a line is replaced
++        bool conf; // single confidence bit to determine whether a line can be replaced */   
++        /**
++         * Default constructor. Invalidate data.
++         */
++        RFCReplData() {
++          c=15;
++          maxCpresent=0;
++          maxCpast=0;
++          conf=1;
++          hashedPC=0;
++        }
++        
++    };
++
++  public:
++    /** Convenience typedef. */
++    typedef RefCountParams Params;
++    
++
++    /**
++     * Construct and initiliaze this replacement policy.
++     */
++    RefCount(const Params *p);
++
++    /**
++     * Destructor.
++     */
++    ~RefCount() {}
++
++    /**
++     * Invalidate replacement data to set it as the next probable victim.
++     * Set confidence bit to 1 and event counter to maximum value.
++     *
++     * @param replacement_data Replacement data to be invalidated.
++     */
++    void invalidate(const std::shared_ptr<ReplacementData>& replacement_data)
++                                                              const override;
++
++    /**
++     * Touch an entry to update its replacement data by setting threshold value and reset event counter.
++     * Increase event counters for each line in set.
++     * 
++     * @param replacement_data Replacement data to be touched.
++     */
++    void touch(const std::shared_ptr<ReplacementData>& replacement_data) const
++                                                                     override;
++
++    /**
++     * Reset replacement data. Used when an entry is inserted. Current threshold and event counter reset to 0.
++     * Previous threshold and confidence bit fetched from prediction table.
++     * 
++     * @param replacement_data Replacement data to be reset.
++     */
++    void reset(const std::shared_ptr<ReplacementData>& replacement_data) const
++                                                                     override;
++
++    /**
++     * Find replacement victim using event counters and threshold values.
++     *
++     * @param cands Replacement candidates, selected by indexing policy.
++     * @return Replacement entry to be replaced.
++     */
++    ReplaceableEntry* getVictim(const ReplacementCandidates& candidates) const
++                                                                     override;
++
++    /**
++     * Instantiate a replacement data entry.
++     *
++     * @return A shared pointer to the new replacement data.
++     */
++    std::shared_ptr<ReplacementData> instantiateEntry() override;
++};
++
++// Class to store and access elements of prediction table
++class IndexTable
++{
++      protected:
++      uint8_t columnAddress;
++      public:
++    /**
++     * Calculate the column value to be fetched by indexing the value of line address.
++     *
++     * @param set and way of victim line.
++     * @return hashed value of line address
++     */
++      uint8_t calculateColumnId(uint32_t victimSet,uint32_t victimWay);
++    /**
++     * store the value of current generation max threshold and confidence bit of victim line
++     *
++     * @param hashed PC and hashed value of line address, maxCpresent and confidence bit
++     */
++      void storeData(uint8_t PC, uint8_t colAddress, uint8_t cStored, bool conf);
++    /**
++     * calculates HashedPC by dividing 64bit PC into 8bit parts and XORing those parts
++     *
++     * @param PC
++     */
++      uint8_t getHashedPC(uint64_t PC);
++    /**
++     * returns stored confidence bit of incoming replacement data
++     *
++     * @param PC and ColumnID
++     * @return  confidence bit
++     */
++      bool getConfidenceBit(uint8_t PC,uint8_t columnID);
++    /**
++     * returns threshold maxCPast of incoming replacement data.
++     *
++     * @param PC and ColumnID
++     * @return  maxCpast
++     */
++      uint8_t  getMaxCPast (uint8_t PC,uint8_t columnID);
++    
++}; 
++
++#endif // __MEM_CACHE_REPLACEMENT_POLICIES_RefCountRP_HH__
+diff -Naur /home/neo/finalWorkRefCnt/gem5/src/mem/cache/replacement_policies/ReplacementPolicies.py /home/neo/myRefCount/gem5/src/mem/cache/replacement_policies/ReplacementPolicies.py
+--- /home/neo/finalWorkRefCnt/gem5/src/mem/cache/replacement_policies/ReplacementPolicies.py	2020-03-24 22:54:57.283632147 -0700
++++ /home/neo/myRefCount/gem5/src/mem/cache/replacement_policies/ReplacementPolicies.py	2020-03-24 23:05:28.516111646 -0700
+@@ -96,3 +96,8 @@
+     cxx_class = 'TreePLRURP'
+     cxx_header = "mem/cache/replacement_policies/tree_plru_rp.hh"
+     num_leaves = Param.Int(Parent.assoc, "Number of leaves in each tree")
++
++class RefCount(BaseReplacementPolicy):
++    type = 'RefCount'
++    cxx_class = 'RefCount'
++    cxx_header = "mem/cache/replacement_policies/refCount_rp.hh"
+diff -Naur /home/neo/finalWorkRefCnt/gem5/src/mem/cache/replacement_policies/SConscript /home/neo/myRefCount/gem5/src/mem/cache/replacement_policies/SConscript
+--- /home/neo/finalWorkRefCnt/gem5/src/mem/cache/replacement_policies/SConscript	2020-03-24 22:54:57.283632147 -0700
++++ /home/neo/myRefCount/gem5/src/mem/cache/replacement_policies/SConscript	2020-03-24 23:05:41.072518436 -0700
+@@ -41,3 +41,4 @@
+ Source('random_rp.cc')
+ Source('second_chance_rp.cc')
+ Source('tree_plru_rp.cc')
++Source('refCount_rp.cc')
