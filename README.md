@@ -19,7 +19,7 @@ After implementing the cache replacement policy successfully, generate another p
 
 >> Go to gem5 folder (diff -Naur <old_folder> <new_folder>
 
->> diff -Naur /home/neo/finalWorkRefCnt/gem5/src/   /home/neo/myRefCount/gem5/src/ > gem5_myrfc.patch
+>> diff -Naur /home/neo/finalWorkRefCnt/gem5/src/   /home/neo/myRefCount/gem5/src/ > gem5_refcount_policy.patch
 
 Note that we only make changes in src folder of gem5 to implement our policy
 
@@ -29,7 +29,7 @@ Note that we only make changes in src folder of gem5 to implement our policy
 
 >> Go to gem5 folder. Assuming that gem5_v2.patch is already applied, run the below mentioned command on gem5 root folder
 
->> patch -p5 -i gem5_myrfc.patch
+>> patch -p5 -i gem5_refcount_policy.patch
 -------------------------------------------------------------------------------------------------------------------------
 3. Build gem to run simulation
 
